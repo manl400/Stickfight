@@ -1,0 +1,22 @@
+{
+  "name": "explosive-stick-fight-server",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch signaling.js",
+    "start": "node signaling.js",
+    "relay": "node relay.js",
+    "lint": "eslint . --ext js --report-unused-disable-directives --max-warnings 0",
+    "format": "prettier --write \"*.js\""
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "fastify": "^4.25.2"
+  },
+  "devDependencies": {
+    "eslint": "^8.55.0",
+    "eslint-config-airbnb-base": "^15.0.0",
+    "eslint-plugin-import": "^2.29.1",
+    "prettier": "^3.1.1"
+  }
+}
