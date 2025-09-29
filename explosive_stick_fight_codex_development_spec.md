@@ -1,359 +1,330 @@
-# Explosive Stick Fight — Codex Development Spec
+# Explosive Stick Fight - Codex Development Spec
 
-> **Scope**: Build, harden, and deploy a browser‑based 1v1 stick‑figure fighting game with explosive meme power‑ups and **secure, easy P2P** connectivity. Include a **room‑code signaling service** and a **WebSocket relay fallback**. This document is developer‑facing and includes APIs, schemas, acceptance criteria, and a QA plan.
+> **Scope**: Build, harden, and deploy a browser-based 1v1 stick-figure fighting game with explosive meme power-ups and secure, easy P2P connectivity. Include a room-code signaling service and a WebSocket relay fallback. This document is developer-facing and includes APIs, schemas, acceptance criteria, and a QA plan.
 
 ---
 
-## 1) Goals & Non‑Goals
+## 1. Goals and Non-Goals
 
 **Goals**
-- Smooth 60fps canvas fighter with deterministic-enough feel under light latency.
-- One‑click **Host / Join via room code**; no SDP copy‑paste.
-- Default connection is **WebRTC DataChannel (DTLS‑SRTP E2E encryption)**.
-- **TURN support** for strict NATs; **relay fallback** if WebRTC fails.
-- Minimal dependencies; straightforward deploy on Vercel/Netlify (client) and Render/Railway/Fly/Glitch (signaling/relay).
-- Telemetry, QA matrix, and production runbook.
+- Deliver a responsive 60 fps canvas fighter that feels deterministic under light-to-moderate latency.
+- One-click host and join via short room codes; no manual SDP copy-paste.
+- Default transport is WebRTC DataChannel secured with DTLS-SRTP and STUN/TURN support for strict NATs.
+- Provide a WebSocket relay fallback that mirrors gameplay when P2P paths fail.
+- Ship with production-ready telemetry, rate limiting, and a runbook for on-call response.
+- Keep dependencies minimal so the client deploys to Vercel/Netlify and the backend to Render/Railway/Fly.
 
-**Non‑Goals**
-- Full rollback netcode / ranked matchmaking.
-- Persistent accounts, inventories, or cloud save.
-- Mobile touch controls (nice‑to‑have, tracked as future enhancement).
+**Non-Goals**
+- Ranked matchmaking, persistent profiles, or inventory systems.
+- Full rollback netcode or prediction beyond light interpolation.
+- Mobile touch-first controls (tracked as a future enhancement).
 
 ---
 
-## 2) Player Experience
+## 2. Player Experience
 
-**Loop:** Host creates a 6‑digit room → shares code → Guest joins → P2P connects → fight to K.O. → press **R** to rematch.
+**Match Flow**: Host clicks "Create Room" and receives a 6-character code. Guest enters the code and joins. Both clients show a ready overlay while signaling completes. Once the DataChannel opens (or relay fallback engages), the fight begins. Players can rematch with the R key.
 
 **Controls**
-- **Host (P1)**: A/D move, W jump, J punch, K kick, E bomb.
-- **Guest (P2)**: ←/→ move, ↑ jump, 1 punch, 2 kick, 0 bomb.
+- Host (P1): A/D move, W jump, J punch, K kick, E meme bomb.
+- Guest (P2): Left/Right arrows move, Up jump, 1 punch, 2 kick, 0 meme bomb.
+- Escape opens pause/help overlay; Enter confirms rematch.
 
-**Mechanics (v1)**
-- World 960×540, ground at y=460, gravity ≈1500 px/s², jump velocity −600 px/s.
-- Accel/Friction/MaxSpeed ≈ 1200 / 800 / 320 px/s.
-- Punch: 0.12s active, 6 dmg, short reach; Kick: 0.16s, 10 dmg, longer reach.
-- Meme Crates spawn ~every 6s (80% chance). Pickup grants **Meme Bomb** (AoE knockback + 12 dmg + screen shake + particles + random meme text).
-- HP 100 → K.O. banner; **R/Enter** resets.
-
-**VFX/UX**
-- Canvas‑only rendering (gradients, particles, radial explosions, floating meme texts).
-- HP bars (P1 left, P2 right), connection status, room code UI, compact error toasts.
+**Visuals and Feedback**
+- Flat-color 960x540 arena with layered parallax background.
+- HP bars at top corners, room code in header, connection quality indicator.
+- Meme bomb triggers radial explosion, screen shake, particle burst, and floating meme text.
+- Toast notifications for connection state, relay fallback, or errors.
 
 ---
 
-## 3) Architecture Overview
+## 3. Gameplay Mechanics
 
-```
-Client (React + Canvas)         Signaling (Node + ws)           TURN (optional)         Relay Fallback (Node + ws)
-┌─────────────────────────┐     ┌───────────────────────┐       ┌──────────────┐        ┌───────────────────────┐
-│ Game Loop (RAF)         │     │ /ws: ephemeral rooms  │       │ coturn       │        │ /relay: echo-forward  │
-│ Physics/Combat/Render   │<===>│ hello/signal messages │<=====>│ (UDP/TCP/TLS)│        │ 2 peers per room      │
-│ WebRTC PC + DataChannel │     │ no game payload       │       └──────────────┘        │ JSON in/out            │
-└─────────────────────────┘     └───────────────────────┘                              └───────────────────────┘
-```
-
-- **Primary path**: WebRTC DataChannel. Signaling server only brokers SDP/ICE over **WSS**; no game data.
-- **Fallback**: WebSocket relay mirrors input/state when P2P unavailable after timeout (configurable).
+- Physics step: 60 Hz fixed timestep with Verlet integration and clamped delta.
+- Gravity: 1500 px/s^2; jump velocity: -600 px/s.
+- Horizontal acceleration: 1200 px/s^2; friction: 800 px/s^2; max speed: 320 px/s.
+- Combat windows: Punch active for 0.12 s (6 damage); kick active for 0.16 s (10 damage). Hit detection uses capsule vs capsule overlap with cooldown to prevent multi-hit frames.
+- Meme crates spawn every 6 +/- 1 seconds with 80% probability. On pickup, player gains a meme bomb (12 damage + strong knockback) and random meme caption.
+- Players start at 100 HP. Knockback scales with damage. Match ends when a player reaches 0 HP; victory banner overlays with option to rematch.
 
 ---
 
-## 4) Frontend Implementation
+## 4. Technical Architecture
 
-**Stack**: React 18 (single component ok), Canvas 2D, Tailwind (via CDN), Vite build.
-
-**Key modules**
-- `useRaf(cb)`: RAF loop.
-- `makePlayer`, `physicsFor`, `tryHit`, `applyExplosions`, `updateFx`.
-- Rendering: `drawStick`, bars, crates, particles, radial boom, meme texts.
-- Networking: `createPeer`, `wireChannel`, `startHost`, `startGuest`, `acceptAnswer`.
-- Signaling client: `connectSignaling({ url, role, room })`.
-- Fallback relay: `connectRelay(url)` (only if WebRTC fails).
-
-**State authority**
-- Host simulates full state; Guest applies host snapshots at ~10fps and only animates FX locally.
-
-**Rates**
-- Input uplink ≈ 30fps; Host → Guest snapshots ≈ 10fps (particles trimmed to ≤60 entries).
-
-**Directory structure (suggested)**
 ```
-/client
-  src/
-    App.jsx
-    net/
-      signaling.js
-      relay.js
-      webrtc.js
-    game/
-      physics.js
-      render.js
-      constants.js
-    ui/
-      RoomConnectPanel.jsx
-  index.html
-  vite.config.ts
-
-/server
-  signaling.js   // WSS WebRTC signaling (rooms)
-  relay.js       // WS relay fallback (optional)
-  package.json
+Client (React + Canvas) ---WSS---> Signaling Service (Node + ws)
+       |                                   |
+       |<== WebRTC DataChannel (preferred) ==>
+       |<== TURN relay path (strict NAT) ===>
+       |---WS JSON--- Relay Fallback (Node + ws)
 ```
 
-**Env/Config**
-- `VITE_SIGNALING_URL=wss://<host>/ws`
-- `VITE_RELAY_URL=wss://<host>/relay` (optional)
-- `VITE_TURN_URLS=turn:turn.example.com:3478`
-- `VITE_TURN_USERNAME=...`
-- `VITE_TURN_CREDENTIAL=...`
-- `VITE_WEBRTC_TIMEOUT_MS=6000` (before trying relay)
+- Client performs gameplay simulation, rendering, input collection, and networking orchestration.
+- Signaling service manages room lifecycle, SDP + ICE exchange, and security policies. It does not process game data.
+- Relay fallback is a lightweight WebSocket server that forwards inputs and state snapshots when direct P2P paths fail.
+- Optional TURN servers (eg. Coturn) provide UDP/TCP/TLS relays for corporate networks.
 
 ---
 
-## 5) Signaling Server (WSS) — API & Behavior
+## 5. Frontend Implementation
 
-**Transport**: WebSocket at `/ws` over **WSS** (TLS via proxy/host). Stateless rooms in memory.
+**Stack**: React 18 + Vite + Canvas 2D + Tailwind via CDN. Audio (optional) via Web Audio API for meme bomb SFX.
 
-**Room semantics**
-- Room key: 6–12 chars, `[A-Z2-9]` recommended, TTL 5 minutes idle.
-- Roles: `host`, `guest`. Max 1 per role.
+**Key Modules**
+- `useRaf(cb)`: RequestAnimationFrame loop with automatic pause on visibility hidden.
+- `physics/`: movement, collision, hit resolution, explosion forces.
+- `render/`: stick figures, particles, UI overlays, connection indicator.
+- `net/webrtc`: peer connection, DataChannel wiring, TURN config, reconnection timers.
+- `net/signaling`: WSS client for hello, room join, and signal forwarding.
+- `net/relay`: fallback connector with exponential backoff.
+- `state/session`: finite state machine for lobby, connecting, fighting, post-match, error.
 
-**Messages (JSON)**
-```ts
-// Client → Server
-{ type: 'hello', role: 'host'|'guest', room: string }
-{ type: 'signal', payload: { sdp?: RTCSessionDescriptionInit, ice?: RTCIceCandidateInit } }
+**Authority Model**
+- Host simulates authoritative state. Guest sends inputs (30 fps) and receives compressed host snapshots (10 fps). Guest lerps/transitions positions and plays local VFX.
 
-// Server → Client
-{ type: 'hello-ack', role: 'host'|'guest' }
-{ type: 'peer-joined' }
-{ type: 'peer-left' }
-{ type: 'signal', payload: { sdp?: RTCSessionDescriptionInit, ice?: RTCIceCandidateInit } }
-{ type: 'error', code: 'ROOM_BUSY'|'ROOM_FULL'|'BAD_ORIGIN'|'BAD_ROLE'|'BAD_ROOM' }
-```
-
-**Validation**
-- Reject if `origin` not on allow‑list.
-- Enforce message size limit (e.g., 64KB) and rate limit (e.g., 20 msgs/sec).
-- Sanitize `room` to `[A-Z2-9]{6,12}`.
-
-**Lifecycle**
-- On `hello`: attach ws to room role, emit `hello-ack`. If guest connects and host present → send `peer-joined` to host.
-- On `signal`: forward payload to the other role if connected.
-- On `close`: clear role; notify the other via `peer-left`. GC room when empty.
+**Rates and Budgets**
+- Input tick: 30 Hz (key diff encoded as sparse map).
+- Snapshot tick: 10 Hz; message trimmed to <= 6 KB with particle pool cap.
+- Render target: locked 60 fps; degrade gracefully to 45 fps by reducing particles and lerp smoothing if needed.
 
 ---
 
-## 6) WebRTC Configuration
+## 6. Networking Flows
 
-**PeerConnection**
-```ts
-new RTCPeerConnection({
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    // Optional, recommended for reliability:
-    { urls: ['turns:turn.example.com:5349','turn:turn.example.com:3478'], username: '<u>', credential: '<p>' }
-  ]
-})
-```
-
-**DataChannel**
-- Label: `"game"`, `{ ordered: true }` (simple sequenced messages).
-- Keep payloads compact JSON; consider binary later.
-
-**Guest smoothing**
-- Lerp positions for 1–2 frames between snapshots to hide jitter.
+1. Host connects to signaling via WSS `/ws`, sends `hello` with role `host` and receives room code and TURN credentials.
+2. Guest submits room code, signaling validates availability, and both sides exchange SDP offers/answers plus ICE candidates.
+3. On DataChannel `open`, clients switch to gameplay mode and stop sending state via signaling.
+4. If WebRTC fails to reach `connected` within 6 seconds or disconnects during play, clients negotiate relay fallback:
+   - Both connect to `/relay` WebSocket.
+   - Host streams authoritative state snapshots; guest streams input updates.
+   - When WebRTC reconnects, clients migrate back and tear down relay.
 
 ---
 
-## 7) Relay Fallback (WS) — API & Behavior (Optional)
+## 7. Signaling Service Specification
 
-**When**: If WebRTC not `connected` after `VITE_WEBRTC_TIMEOUT_MS` → connect to `/relay`.
+**Stack**: Node 18 + `ws`, optional `fastify` for health endpoints. Single stateless process behind HTTPS reverse proxy.
 
-**Server**: Holds up to 2 peers per room; forwards any JSON message to the other peer as‑is.
+**Endpoints**
+- `GET /health`: returns `200 ok`.
+- `GET /config`: optional JSON with TURN URLs and relay endpoint for client bootstrap.
+- `WSS /ws`: primary socket for signaling messages.
 
-**Client messages (suggested)**
-```ts
-{ type: 'role', role: 'host'|'guest', room: string }
-{ type: 'input', payload: KeyStateMap }         // from each peer continuously
-{ type: 'state', payload: HostSnapshot }        // host → guest ~10fps
-```
+**Room Lifecycle**
+- Room code: base32 (A-Z, 2-7) 6 characters, server-generated, TTL 2 minutes idle / 30 minutes max.
+- Host must send heartbeat every 20 seconds or room expires.
+- A room can only hold one host and one guest. Additional guests receive `ROOM_FULL`.
 
-**Security**: WSS required; still no PII. Note: no E2E encryption at transport layer (server can read JSON). Use app‑level AES‑GCM if desired.
+**Rate Limiting**
+- 30 handshakes per IP per 10 minutes; 5 concurrent rooms per IP. Bursts enforced via token bucket.
+- Room code brute force mitigated by requiring `hello` handshake and per-IP cooldown on repeated failures.
 
----
+**Message Contract** (JSON via WSS)
+- `hello`: `{ "type": "hello", "role": "host"|"guest", "room": "ABC123"? }`
+- `hello-ack`: `{ "type": "hello-ack", "room": "ABC123", "role": "host", "turn": { "urls": [...], "username": "...", "credential": "..." } }`
+- `signal`: `{ "type": "signal", "payload": { "sdp"|"ice": {...} } }`
+- `candidate-end`: optional message when ICE gathering completes.
+- `error`: `{ "type": "error", "code": "ROOM_NOT_FOUND"|"ROOM_FULL"|"BAD_ORIGIN"|... }`
 
-## 8) Security & Privacy
-
-- **Transport**: WSS for signaling/relay; DTLS‑SRTP for DataChannel (E2E by default).
-- **Origin allow‑list** for signaling/relay (reject all others).
-- **No logs of SDP/ICE payloads**; emit only connection metrics (counts, durations).
-- **Room code TTL** and random generation; deny reuse after idle.
-- **Rate limiting** and message size caps.
-- **Content Security Policy (CSP)** restricting script origins.
-- **App‑layer encryption (optional)**: passphrase → PBKDF2 → AES‑GCM for payloads.
-
-**Threats & Mitigations**
-- MITM on signaling → WSS + origin check.
-- DoS via room floods → rate limit + IP‑based backoff.
-- Data exfil in relay mode → encourage WebRTC path; support optional app‑layer crypto.
+**Security**
+- Validate `Origin`, `Sec-WebSocket-Protocol`, and rate limit per IP.
+- Drop oversized messages (>32 KB) and reject unknown message types.
+- Log only high-level metadata (room, role, duration); never persist SDP or ICE payloads.
 
 ---
 
-## 9) Telemetry & Observability
+## 8. Relay Fallback Specification
+
+**Purpose**: Provide a guaranteed path when WebRTC cannot connect or maintain a session.
+
+**Behavior**
+- Clients connect via WSS `wss://<host>/relay` with role and room code.
+- Server keeps minimal state: host socket reference, guest socket reference, heartbeat timers.
+- Host sends authoritative snapshot messages; guest sends input delta messages. Server performs no simulation.
+- Relay enforces 60 messages per second per connection (throttled) and maximum payload 8 KB.
+
+**Messages**
+- `role`: `{ "type": "role", "role": "host"|"guest", "room": "ABC123" }`
+- `input`: `{ "type": "input", "seq": 42, "payload": { "KeyA": true } }`
+- `state`: `{ "type": "state", "seq": 42, "payload": { "players": {...}, "crates": [...], "effects": [...] } }`
+- `pong`: server heartbeat reply. Clients send `ping` every 10 seconds.
+
+**Fallback Triggering**
+- Client enters relay mode if DataChannel does not reach `connected` within timeout or transitions to `failed`.
+- Once WebRTC recovers and stays stable for 5 seconds, clients close relay sockets.
+
+---
+
+## 9. Security and Privacy
+
+- All signaling and relay traffic runs over WSS (TLS 1.2+). Client enforces HTTPS origin.
+- TURN credentials minted per room with short TTL using TURN REST API (HMAC-based).
+- Room codes are random and not guessable; server rejects predictable client-supplied codes.
+- Do not log raw SDP, ICE, or gameplay payloads. Redact IPs when storing aggregated metrics.
+- Sanitize meme captions to ASCII, length <= 32, and filter common slurs. Future enhancement: server-provided meme text list.
+- Use Content Security Policy: default-src 'self'; connect-src signaling, relay, turn URLs.
+
+---
+
+## 10. Telemetry and Observability
 
 **Client Events**
-- `conn_start`, `conn_connected`, `conn_failed`, `conn_fallback_ws`.
-- `webrtc_state_change` (iceGathering/connection/datachannel states).
-- `rtt_ms` via ping/pong every 5s.
-- Gameplay: `match_start`, `match_end`, `winner`, `crates_spawned`, `bombs_used`, `hits_landed`, `duration_s`.
+- `connection_start`, `webrtc_connected`, `relay_fallback`, `match_start`, `match_end`, `error_displayed`.
+- Includes room code hash, duration, success/failure reason, network quality indicators (RTT, packet loss).
 
 **Server Metrics**
-- Active rooms, connect attempts, success rate, median connect time.
-- Errors by code; message/sec per IP (for rate limiting).
+- Handshake success rate, average connect time, error codes distribution.
+- Active rooms, relay utilization, TURN credential issuance count.
+- Rate-limit drops and authentication failures.
 
-Use OpenTelemetry or minimal JSON logs -> stdout; scrape via platform provider.
+**Logging**
+- Structured JSON logs (pino/console) with fields: timestamp, subsystem, level, room, ip_hash, event, duration_ms.
+- Retention: 14 days for info, 90 days for warnings/errors.
 
----
-
-## 10) QA Plan
-
-**Browsers**: Chrome (latest −1), Edge (Chromium), Firefox (latest −1), Safari 17+.
-
-**OS**: Windows 10/11, macOS 13+, iOS 17 (view‑only v1), Android 13+.
-
-**Network scenarios**
-- Same LAN, both on Wi‑Fi.
-- Different ISPs, UPnP on.
-- Corporate/VPN (expect TURN path or relay fallback).
-
-**Test cases**
-1. Host/Guest connect via room code; DC opens within timeout.
-2. Packet loss 5–10%: no desync, acceptable jitter.
-3. Guest disconnect mid‑match → host sees toast; reconnects with same room.
-4. Relay fallback triggers and gameplay remains responsive.
-5. TURN credentials invalid → connection fails → relay fallback works.
-6. Rate limit breach → server returns error; UI shows friendly retry guidance.
-7. Accessibility: tab‑focus all controls; contrast AA; canvas has accessible name/description.
+**Tracing**
+- Optional OpenTelemetry spans around signaling lifecycle if deployed on managed platforms supporting OTLP.
 
 ---
 
-## 11) Performance Budgets
+## 11. Data Contracts and Schemas
 
-- Frame time ≤ 16.7ms on 2‑core laptop; no GC spikes > 10ms.
-- Snapshot payload ≤ 6KB; input msg ≤ 200B; average DC throughput < 20kbps.
-- Particle cap per frame ≤ 120; explosions ≤ 3 simultaneous.
+```json
+// HostSnapshot
+{
+  "type": "state",
+  "seq": 123,
+  "ts": 1689342345234,
+  "payload": {
+    "players": {
+      "p1": { "hp": 84, "pos": { "x": 120, "y": 420 }, "vel": { "x": 0, "y": 0 }, "facing": 1, "bombReady": true },
+      "p2": { "hp": 72, "pos": { "x": 720, "y": 420 }, "vel": { "x": -10, "y": 0 }, "facing": -1, "bombReady": false }
+    },
+    "crates": [{ "id": "c1", "x": 480, "y": 440, "type": "meme" }],
+    "effects": [{ "id": "fx7", "kind": "explosion", "ttl": 240 }],
+    "winner": null
+  }
+}
+
+// InputDelta
+{
+  "type": "input",
+  "seq": 124,
+  "ts": 1689342345300,
+  "payload": { "KeyA": true, "KeyD": false, "KeyW": false, "KeyJ": false, "KeyK": true }
+}
+
+// Signaling Error
+{ "type": "error", "code": "ROOM_NOT_FOUND", "message": "Room expired" }
+```
+
+Type aliases (JSDoc or TypeScript) should live in `client/src/types/net.d.ts` and `server/types.d.ts` for shared understanding.
 
 ---
 
-## 12) Accessibility & Intl
+## 12. Performance Budgets
 
-- Keyboard‑only operable; visible focus rings.
-- Canvas `role="img"` with `aria-label` describing action.
-- UI copy externalized for future i18n.
+- Frame time <= 16.7 ms on 2-core laptop (Chromebook class). No GC pause > 10 ms per minute.
+- Snapshot payload <= 6 KB; Input payload <= 200 B. DataChannel throughput < 20 kbps average.
+- Relay mode latency budget: < 120 ms round-trip on broadband.
+- Initial load <= 2 MB compressed (JS, CSS, assets). Inline art uses procedural drawing, no heavy textures.
 
 ---
 
-## 13) Build, Deploy, and Runbook
+## 13. QA Plan
+
+**Coverage Matrix**
+- Browsers: Chrome (latest -2), Firefox (latest -2), Edge (Chromium latest -2), Safari (latest, macOS/iOS).
+- OS: Windows 10/11, macOS 13+, Ubuntu 22.04, iOS 16+, Android 13 (Chromium-based browsers only).
+
+**Test Categories**
+- Functional: lobby creation/join, disconnection handling, meme crate spawns, combat interactions, rematch flow.
+- Networking: P2P happy path, TURN-only path, relay fallback, packet loss/jitter injection (Chrome net internals or Clumsy).
+- Performance: FPS measurement with Chrome DevTools, CPU throttling to 4x slowdown, memory leak checks.
+- Security: Origin enforcement, room brute force attempt, oversized message rejection, TURN credential expiry.
+- Accessibility: Keyboard navigation, focus outlines, screen reader labels, color contrast AA, pause overlay semantics.
+
+**Automation**
+- Integration tests with Playwright to smoke-test host/guest flows via mock signaling server.
+- Unit tests for physics, collision detection, and net message validation (Vitest/Jest).
+- Linting (ESLint) and formatting (Prettier) in CI.
+
+---
+
+## 14. Acceptance Criteria (v1)
+
+1. Host and guest can connect via room code and establish WebRTC DataChannel in <= 6 seconds median on residential networks.
+2. With only TURN reachability, the match still starts and completes without desync.
+3. If WebRTC fails or drops mid-match, relay fallback connects within 3 seconds and gameplay remains responsive.
+4. Meme crates spawn, bombs apply damage and knockback, and matches resolve with accurate win detection.
+5. Client maintains 60 fps on mid-tier hardware and gracefully degrades with clear UI indicators.
+6. Telemetry events appear in server logs and metrics dashboards with correct fields.
+7. QA plan scenarios execute without high-severity defects.
+
+---
+
+## 15. Deployment and Runbook
 
 **Client**
-- Vite build → deploy to Vercel/Netlify; enforce HTTPS; set env with signaling/relay URLs.
+- Build with `npm run build` (Vite). Deploy dist artifacts to Vercel/Netlify with forced HTTPS and HTTP/2.
+- Environment variables: `VITE_SIGNALING_URL`, `VITE_RELAY_URL`, `VITE_TURN_URLS`, `VITE_TURN_API_KEY` (if using dynamic TURN credentials).
 
 **Server**
-- Node 18+; `npm i ws`; expose `/ws` and optionally `/relay`.
-- Behind reverse proxy (Caddy/Nginx) for TLS; enable compression off for WS; set idle timeouts.
-- Health endpoints: `/health` → 200 `ok`.
+- Node 18 runtime. Install dependencies (`npm install`). Start with `node signaling.js` and optional `node relay.js`.
+- Reverse proxy (Caddy/Nginx) terminates TLS, enforces WSS, sets `Connection: Upgrade`, applies rate limiting, and injects security headers.
+- Use PM2 or systemd for process supervision. Configure health check for `/health` (30 second interval, 5 second timeout).
 
 **Runbook**
-- Rollout: blue/green with 1% canary.
-- Alarms: connect success rate drops >15% over 10m; 5xx error spike; memory >80%.
-- Emergency switch: force **relay mode** via env flag while TURN incident resolves.
+- Monitoring alerts: connect success rate drops > 15% in 10 minutes, relay utilization > 40%, 5xx errors > 5 per minute, memory > 80%.
+- Incident steps: check signaling logs, verify TURN credential issuance, fail over to relay-only mode by toggling env `FORCE_RELAY=true`, notify players via status page.
+- Rollback: blue/green deploy with 5% canary traffic for 10 minutes before full rollout.
 
 ---
 
-## 14) Acceptance Criteria (v1)
+## 16. Risks and Mitigations
 
-1. **Room‑code connection**: Host+Guest can connect P2P via WSS signaling in ≤ 6s median on residential networks.
-2. **TURN path**: With only TURN reachable, peers still connect and play.
-3. **Fallback**: If WebRTC not connected within timeout, relay mode connects and match is playable end‑to‑end.
-4. **Security**: WSS enforced; origin allow‑list; no SDP/ICE logs; room TTL; rate limiting enabled.
-5. **Gameplay**: All controls responsive; crates spawn; bombs function; K.O. + reset works; 60fps on mid‑tier hardware.
-6. **Telemetry**: Events emitted and visible in logs/metrics.
-7. **QA matrix**: Browsers/OS coverage passed.
+- Strict enterprise NATs: supply TURN over TCP/TLS and maintain relay fallback.
+- High latency jitter: increase guest interpolation buffer, dynamically adjust snapshot rate.
+- Browser quirks (Safari, Firefox DataChannel issues): feature-detect unreliable channels, polyfill `RTCPeerConnection.onnegotiationneeded`.
+- Abuse and griefing: enforce per-IP rate limits, captcha challenge at reverse proxy if anomaly detected, throttle meme bomb spam via cooldown.
+- Cheating attempts: host-authoritative simulation and server-validated inputs during relay fallback.
 
 ---
 
-## 15) APIs & Schemas
+## 17. Future Enhancements
 
-**Signaling**
-```jsonc
-// hello
-{"type":"hello","role":"host","room":"AB12CD"}
-// hello-ack
-{"type":"hello-ack","role":"host"}
-// signal (SDP)
-{"type":"signal","payload":{"sdp":{"type":"offer","sdp":"..."}}}
-// signal (ICE)
-{"type":"signal","payload":{"ice":{"candidate":"...","sdpMid":"0","sdpMLineIndex":0}}}
-// errors
-{"type":"error","code":"ROOM_FULL"}
-```
-
-**Relay** (optional)
-```jsonc
-{"type":"role","role":"host","room":"AB12CD"}
-{"type":"input","payload":{"KeyA":true,"KeyD":false}}
-{"type":"state","payload":{"p1":{...},"p2":{...},"crates":[],"winner":null}}
-```
-
-**Type Notes**
-- `HostSnapshot` trims particles (≤60), explosions (≤3), includes HP/pos/vel of both players.
-- `KeyStateMap` is sparse boolean dictionary of pressed keys.
+- Rollback netcode prototype for competitive play.
+- Gamepad and mobile touch controls with responsive layout.
+- Cosmetic unlocks, victory taunts, and audio packs.
+- Binary snapshot encoding (ArrayBuffer) to reduce payload size and GC churn.
+- In-app friend list and lobby discovery using short-lived auth tokens.
 
 ---
 
-## 16) Risks & Mitigations
+## 18. Developer Notes and Conventions
 
-- **Strict corporate NATs**: include TURN; retain relay fallback.
-- **High latency jitter**: increase guest interpolation window; reduce snapshot rate to stabilize.
-- **Browser quirks (Safari)**: test DC reliability; polyfill where needed.
-- **Abuse**: rate limit handshakes; CAPTCHAs behind reverse proxy if necessary.
-
----
-
-## 17) Future Enhancements
-
-- Automatic lobby discovery (room directory) with short‑lived tokens.
-- Binary snapshots (ArrayBuffer) to reduce payload and GC.
-- Gamepad & mobile touch controls; responsive canvas scaling.
-- Cosmetics: palette swaps, trails, SFX (CC0/royalty‑free).
-- Rollback netcode prototype for competitive feel.
+- Use ESLint (airbnb base) and Prettier with 2-space indentation. Enforce via pre-commit hooks.
+- JSDoc or TypeScript typedefs for shared network and physics types.
+- Avoid object churn inside the render loop; reuse vector objects and particle pools.
+- Wrap `JSON.parse` in try/catch; clamp message sizes and ignore unknown keys.
+- Feature flags: `VITE_FORCE_RELAY`, `VITE_DISABLE_PARTICLES`, `FORCE_TURN_ONLY`.
 
 ---
 
-## 18) Dev Notes & Conventions
+### Appendix A: WebRTC Handshake Sequence
 
-- Code style: Prettier + ESLint (airbnb‑ish). Type JSDoc for shared types.
-- Avoid object churn in RAF loop; reuse arrays/objects; pool particles.
-- Guard all JSON.parse with try/catch; clamp message sizes.
-- Feature flags via env (e.g., `VITE_FORCE_RELAY=true`).
+1. Host opens WSS and sends `hello(role=host)`.
+2. Server returns room code and TURN credentials.
+3. Guest sends `hello(role=guest, room=CODE)`.
+4. Host creates offer, sets local description, sends `signal(sdp:offer)`.
+5. Guest sets remote description, creates answer, sends `signal(sdp:answer)`.
+6. Both sides exchange ICE candidates via `signal(ice)` until gathering completes.
+7. DataChannel fires `open`; gameplay loop starts.
 
----
+### Appendix B: QA Regression Checklist
 
-### Appendix A — Example Sequence (P2P)
-```
-Guest UI → enter room → hello(role=guest)
-Host UI  → enter room → hello(role=host)
-Host PC: createOffer → setLocal → signal(sdp:offer)
-Guest PC: setRemote(offer) → createAnswer → setLocal → signal(sdp:answer)
-Both: onicecandidate → signal(ice) → addIceCandidate
-DataChannel 'open' → start input uplink + host snapshots → match start
-```
-
-### Appendix B — Minimal Health Checklist
-- [ ] `/health` returns 200.
-- [ ] Connect success rate ≥ 90% over last 24h.
-- [ ] Median connect time ≤ 6s.
-- [ ] Error rate by code below thresholds (ROOM_FULL, BAD_ORIGIN, etc.).
-- [ ] Relay fallback rate < 20% on residential networks.
-
+- [ ] `/health` returns `200 ok`.
+- [ ] Connect success rate >= 90% over last 24 hours.
+- [ ] Median connect time <= 6 seconds.
+- [ ] Relay fallback activation rate < 20% on residential networks.
+- [ ] No unhandled promise rejections in console logs.
+- [ ] Accessibility audits (Lighthouse) score >= 90.
